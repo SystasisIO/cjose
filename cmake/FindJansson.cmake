@@ -18,6 +18,8 @@
 include(FindPackageHandleStandardArgs)
 
 set(Jansson_VERSION "")
+set(_jansson_config_target FALSE)
+set(_jansson_include_dirs "")
 
 # 1) Prefer the upstream CMake package config, if present.
 find_package(jansson CONFIG QUIET)
@@ -27,9 +29,8 @@ if(jansson_FOUND AND TARGET jansson::jansson)
         set_target_properties(Jansson::Jansson PROPERTIES
             INTERFACE_LINK_LIBRARIES jansson::jansson)
     endif()
-    if(DEFINED jansson_VERSION)
-        set(Jansson_VERSION "${jansson_VERSION}")
-    endif()
+    set(_jansson_config_target TRUE)
+    get_target_property(_jansson_include_dirs jansson::jansson INTERFACE_INCLUDE_DIRECTORIES)
 else()
     # 2) Fall back to pkg-config + manual discovery.
     find_package(PkgConfig QUIET)
@@ -45,15 +46,7 @@ else()
         NAMES jansson libjansson
         HINTS ${PC_JANSSON_LIBDIR} ${PC_JANSSON_LIBRARY_DIRS})
 
-    if(PC_JANSSON_VERSION)
-        set(Jansson_VERSION "${PC_JANSSON_VERSION}")
-    elseif(Jansson_INCLUDE_DIR AND EXISTS "${Jansson_INCLUDE_DIR}/jansson.h")
-        file(STRINGS "${Jansson_INCLUDE_DIR}/jansson.h" _jansson_version_line
-            REGEX "^#define[ \t]+JANSSON_VERSION[ \t]+\"[^\"]+\"")
-        if(_jansson_version_line)
-            string(REGEX REPLACE ".*\"([^\"]+)\".*" "\\1" Jansson_VERSION "${_jansson_version_line}")
-        endif()
-    endif()
+    set(_jansson_include_dirs "${Jansson_INCLUDE_DIR}")
 
     if(Jansson_LIBRARY AND Jansson_INCLUDE_DIR)
         set(Jansson_LIBRARIES ${Jansson_LIBRARY})
@@ -68,6 +61,27 @@ else()
 
     mark_as_advanced(Jansson_INCLUDE_DIR Jansson_LIBRARY)
 endif()
+
+# Some upstream configs report the library ABI version, not the release version.
+# Read only headers belonging to the selected target/discovery path; do not
+# search another installation to assign a version to a config-package target.
+foreach(_jansson_include_dir IN LISTS _jansson_include_dirs)
+    if(IS_ABSOLUTE "${_jansson_include_dir}" AND EXISTS "${_jansson_include_dir}/jansson.h")
+        file(STRINGS "${_jansson_include_dir}/jansson.h" _jansson_version_line
+            LIMIT_COUNT 1 REGEX "^[ \t]*#[ \t]*define[ \t]+JANSSON_VERSION[ \t]+\"[^\"]+\"")
+        if(_jansson_version_line)
+            string(REGEX REPLACE ".*\"([^\"]+)\".*" "\\1" Jansson_VERSION "${_jansson_version_line}")
+            break()
+        endif()
+    endif()
+endforeach()
+if(NOT Jansson_VERSION AND NOT _jansson_config_target AND PC_JANSSON_VERSION)
+    set(Jansson_VERSION "${PC_JANSSON_VERSION}")
+endif()
+unset(_jansson_config_target)
+unset(_jansson_include_dirs)
+unset(_jansson_include_dir)
+unset(_jansson_version_line)
 
 # Single validation point so the requested version is checked for both paths.
 if(TARGET Jansson::Jansson)

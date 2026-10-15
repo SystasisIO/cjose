@@ -42,10 +42,13 @@ if(@CJOSE_BUILD_STATIC@)
     unset(_cjose_require_static)
 endif()
 
-if(TARGET cjose::cjose_shared)
-    add_library(cjose::cjose ALIAS cjose::cjose_shared)
-elseif(TARGET cjose::cjose_static)
-    add_library(cjose::cjose ALIAS cjose::cjose_static)
+# Repeated discovery must still re-evaluate the requested components above.
+if(NOT TARGET cjose::cjose)
+    if(TARGET cjose::cjose_shared)
+        add_library(cjose::cjose ALIAS cjose::cjose_shared)
+    elseif(TARGET cjose::cjose_static)
+        add_library(cjose::cjose ALIAS cjose::cjose_static)
+    endif()
 endif()
 
 check_required_components(cjose)
