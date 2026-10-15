@@ -6,6 +6,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 #include <check.h>
 #include <cjose/cjose.h>
 #include <jansson.h>
@@ -1548,6 +1549,336 @@ START_TEST(test_cjose_jws_verify_ec_sig_bad_length)
 }
 END_TEST
 
+// Public key, signing input and signature from RFC 7515 appendix A.3.
+// https://www.rfc-editor.org/rfc/rfc7515.html#appendix-A.3
+static const char *JWK_EXTERNAL_PUBLIC = "{\"kty\":\"EC\",\"crv\":\"P-256\","
+                                        "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+                                        "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
+static const char *JWS_EXTERNAL_PAYLOAD = "{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}";
+static const char *JWS_EXTERNAL_INPUT = "eyJhbGciOiJFUzI1NiJ9."
+                                       "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFt"
+                                       "cGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+static const char *JWS_EXTERNAL_COMPACT = "eyJhbGciOiJFUzI1NiJ9."
+                                         "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFt"
+                                         "cGxlLmNvbS9pc19yb290Ijp0cnVlfQ."
+                                         "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSA"
+                                         "pmWQxfKTUJqPP3-Kg6NU1Q";
+static const uint8_t JWS_EXTERNAL_SIGNATURE[64]
+    = { 14, 209, 33, 83, 121, 99, 108, 72, 60, 47, 127, 21, 88, 7, 212, 2, 163, 178, 40, 3, 58, 249,
+        124, 126, 23, 129, 154, 195, 22, 158, 166, 101, 197, 10, 7, 211, 140, 60, 112, 229, 216, 241, 45,
+        175, 8, 74, 84, 128, 166, 101, 144, 197, 242, 147, 80, 154, 143, 63, 127, 138, 131, 163, 84, 213 };
+
+static cjose_jws_prepared_t *_external_prepare(cjose_err *err)
+{
+    cjose_jwk_t *jwk = cjose_jwk_import(JWK_EXTERNAL_PUBLIC, strlen(JWK_EXTERNAL_PUBLIC), err);
+    cjose_header_t *header = cjose_header_new(err);
+    ck_assert(NULL != jwk);
+    ck_assert(NULL != header);
+    ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, CJOSE_HDR_ALG_ES256, err));
+    cjose_jws_prepared_t *prepared
+        = cjose_jws_prepare(jwk, header, (const uint8_t *)JWS_EXTERNAL_PAYLOAD, strlen(JWS_EXTERNAL_PAYLOAD), err);
+    ck_assert_msg(NULL != prepared, "cjose_jws_prepare failed: %s", err->message);
+    cjose_header_release(header);
+    cjose_jwk_release(jwk);
+    return prepared;
+}
+
+START_TEST(test_cjose_jws_external_vector)
+{
+    cjose_err err;
+    ck_assert_int_eq(1, CJOSE_JWS_EXTERNAL_SIGNING_API);
+    cjose_jws_prepared_t *prepared = _external_prepare(&err);
+    const uint8_t *input = NULL, *digest = NULL;
+    size_t input_len = 0, digest_len = 0;
+    ck_assert(cjose_jws_prepared_get_signing_input(prepared, &input, &input_len, &err));
+    ck_assert_int_eq(strlen(JWS_EXTERNAL_INPUT), input_len);
+    ck_assert(0 == memcmp(input, JWS_EXTERNAL_INPUT, input_len));
+    ck_assert(cjose_jws_prepared_get_digest(prepared, &digest, &digest_len, &err));
+    ck_assert_int_eq(32, digest_len);
+    uint8_t expected_digest[EVP_MAX_MD_SIZE];
+    unsigned int expected_len = 0;
+    ck_assert_int_eq(1, EVP_Digest(JWS_EXTERNAL_INPUT, strlen(JWS_EXTERNAL_INPUT), expected_digest, &expected_len,
+                                 EVP_sha256(), NULL));
+    ck_assert_int_eq(expected_len, digest_len);
+    ck_assert(0 == memcmp(digest, expected_digest, digest_len));
+
+    cjose_jws_t *jws = cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err);
+    ck_assert_msg(NULL != jws, "cjose_jws_complete failed: %s", err.message);
+    ck_assert(NULL == cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err));
+    ck_assert_int_eq(CJOSE_ERR_INVALID_STATE, err.code);
+    const uint8_t *after = NULL;
+    size_t after_len = 0;
+    ck_assert(cjose_jws_prepared_get_signing_input(prepared, &after, &after_len, &err));
+    ck_assert(input == after);
+    ck_assert_int_eq(input_len, after_len);
+    ck_assert(cjose_jws_prepared_get_digest(prepared, &after, &after_len, &err));
+    ck_assert(digest == after);
+    ck_assert_int_eq(digest_len, after_len);
+    cjose_jws_prepared_release(prepared);
+
+    const char *compact = NULL;
+    ck_assert(cjose_jws_export(jws, &compact, &err));
+    ck_assert_str_eq(JWS_EXTERNAL_COMPACT, compact);
+    cjose_jwk_t *jwk = cjose_jwk_import(JWK_EXTERNAL_PUBLIC, strlen(JWK_EXTERNAL_PUBLIC), &err);
+    ck_assert(NULL != jwk);
+    ck_assert(cjose_jws_verify(jws, jwk, &err));
+    cjose_jws_t *imported = cjose_jws_import(compact, strlen(compact), &err);
+    ck_assert(NULL != imported);
+    ck_assert(cjose_jws_verify(imported, jwk, &err));
+    cjose_jws_release(imported);
+    cjose_jws_release(jws);
+    cjose_jwk_release(jwk);
+}
+END_TEST
+
+START_TEST(test_cjose_jws_external_caller_mutation)
+{
+    cjose_err err;
+    static const uint8_t original[] = { 0, 1, 127, 128, 255 };
+    uint8_t payload[sizeof(original)];
+    memcpy(payload, original, sizeof(payload));
+    cjose_jwk_t *private_jwk = cjose_jwk_import(JWK_COMMON_EC, strlen(JWK_COMMON_EC), &err);
+    ck_assert(NULL != private_jwk);
+    char *public_json = cjose_jwk_to_json(private_jwk, false, &err);
+    ck_assert(NULL != public_json);
+    cjose_jwk_t *public_jwk = cjose_jwk_import(public_json, strlen(public_json), &err);
+    ck_assert(NULL != public_jwk);
+    cjose_header_t *header = (cjose_header_t *)json_loads("{\"alg\":\"ES256\",\"extra\":{\"value\":\"original\"}}", 0, NULL);
+    ck_assert(NULL != header);
+    cjose_jws_t *signed_jws = cjose_jws_sign(private_jwk, header, payload, sizeof(payload), &err);
+    ck_assert(NULL != signed_jws);
+    uint8_t signature[64];
+    ck_assert_int_eq(sizeof(signature), signed_jws->sig_len);
+    memcpy(signature, signed_jws->sig, sizeof(signature));
+    cjose_jws_prepared_t *prepared = cjose_jws_prepare(public_jwk, header, payload, sizeof(payload), &err);
+    ck_assert(NULL != prepared);
+    const uint8_t *digest = NULL;
+    size_t digest_len = 0;
+    ck_assert(cjose_jws_prepared_get_digest(prepared, &digest, &digest_len, &err));
+    uint8_t saved_digest[32];
+    memcpy(saved_digest, digest, sizeof(saved_digest));
+
+    memset(payload, 42, sizeof(payload));
+    ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, CJOSE_HDR_ALG_RS256, &err));
+    ck_assert_int_eq(0, json_object_set_new(json_object_get((json_t *)header, "extra"), "value", json_string("changed")));
+    cjose_jwk_t *replacement = cjose_jwk_import(JWK_EXTERNAL_PUBLIC, strlen(JWK_EXTERNAL_PUBLIC), &err);
+    ck_assert(NULL != replacement);
+    ec_keydata *caller_key = (ec_keydata *)cjose_jwk_get_keydata(public_jwk, &err);
+    ec_keydata *other_key = (ec_keydata *)cjose_jwk_get_keydata(replacement, &err);
+    ck_assert_int_eq(1, EC_KEY_set_public_key(caller_key->key, EC_KEY_get0_public_key(other_key->key)));
+    ck_assert(cjose_jwk_set_kid(public_jwk, "changed", 7, &err));
+    cjose_jwk_release(replacement);
+    cjose_jwk_release(public_jwk);
+    cjose_jwk_release(private_jwk);
+    cjose_jws_release(signed_jws);
+    cjose_header_release(header);
+
+    cjose_jws_t *jws = cjose_jws_complete(prepared, signature, sizeof(signature), &err);
+    ck_assert_msg(NULL != jws, "caller mutation changed prepared state: %s", err.message);
+    memset(signature, 0, sizeof(signature));
+    ck_assert_str_eq(CJOSE_HDR_ALG_ES256, cjose_header_get(cjose_jws_get_protected(jws), CJOSE_HDR_ALG, &err));
+    ck_assert_str_eq("original", json_string_value(json_object_get(json_object_get((json_t *)cjose_jws_get_protected(jws),
+                                                                                  "extra"), "value")));
+    uint8_t *actual = NULL;
+    size_t actual_len = 0;
+    ck_assert(cjose_jws_get_plaintext(jws, &actual, &actual_len, &err));
+    ck_assert_int_eq(sizeof(original), actual_len);
+    ck_assert(0 == memcmp(original, actual, actual_len));
+    public_jwk = cjose_jwk_import(public_json, strlen(public_json), &err);
+    ck_assert(NULL != public_jwk);
+    ck_assert(cjose_jws_verify(jws, public_jwk, &err));
+    cjose_jwk_release(public_jwk);
+    cjose_get_dealloc()(public_json);
+    cjose_jws_release(jws);
+    ck_assert(cjose_jws_prepared_get_digest(prepared, &digest, &digest_len, &err));
+    ck_assert_int_eq(sizeof(saved_digest), digest_len);
+    ck_assert(0 == memcmp(saved_digest, digest, digest_len));
+    cjose_jws_prepared_release(prepared);
+}
+END_TEST
+
+START_TEST(test_cjose_jws_external_bad_prepare)
+{
+    cjose_err err;
+    cjose_jwk_t *public_jwk = cjose_jwk_import(JWK_EXTERNAL_PUBLIC, strlen(JWK_EXTERNAL_PUBLIC), &err);
+    cjose_header_t *header = cjose_header_new(&err);
+    ck_assert(NULL != public_jwk);
+    ck_assert(NULL != header);
+    const uint8_t *payload = (const uint8_t *)"payload";
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, 7, &err));
+    static const char *bad_algs[] = { "", "none", "RS256", "HS256", "ES384", "ES512", "ES256K", "Ed25519" };
+    for (size_t i = 0; i < sizeof(bad_algs) / sizeof(bad_algs[0]); ++i)
+    {
+        ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, bad_algs[i], &err));
+        ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, 7, &err));
+        ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+    }
+    ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, CJOSE_HDR_ALG_ES256, &err));
+    ck_assert(NULL == cjose_jws_prepare(NULL, header, payload, 7, &err));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, NULL, payload, 7, &err));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, (cjose_header_t *)json_true(), payload, 7, &err));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, NULL, 0, &err));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, SIZE_MAX, &err));
+    ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, INT_MAX, &err));
+    ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+
+    ck_assert_int_eq(0, json_object_set((json_t *)header, "b64", json_false()));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, 7, &err));
+    ck_assert_int_eq(0, json_object_del((json_t *)header, "b64"));
+    ck_assert_int_eq(0, json_object_set_new((json_t *)header, "crit", json_loads("[\"unsupported\"]", 0, NULL)));
+    ck_assert(NULL == cjose_jws_prepare(public_jwk, header, payload, 7, &err));
+    ck_assert_int_eq(0, json_object_del((json_t *)header, "crit"));
+
+    const char *bad_keys[] = { JWK_COMMON_EC, JWK_COMMON, JWK_COMMON_OCT };
+    for (size_t i = 0; i < sizeof(bad_keys) / sizeof(bad_keys[0]); ++i)
+    {
+        cjose_jwk_t *key = cjose_jwk_import(bad_keys[i], strlen(bad_keys[i]), &err);
+        ck_assert(NULL != key);
+        ck_assert(NULL == cjose_jws_prepare(key, header, payload, 7, &err));
+        ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+        cjose_jwk_release(key);
+    }
+    const cjose_jwk_ec_curve curves[] = { CJOSE_JWK_EC_P_384, CJOSE_JWK_EC_P_521, CJOSE_JWK_EC_SECP_256K1 };
+    for (size_t i = 0; i < sizeof(curves) / sizeof(curves[0]); ++i)
+    {
+        cjose_jwk_t *key = cjose_jwk_create_EC_random(curves[i], &err);
+        ck_assert(NULL != key);
+        char *json = cjose_jwk_to_json(key, false, &err);
+        ck_assert(NULL != json);
+        cjose_jwk_t *pub = cjose_jwk_import(json, strlen(json), &err);
+        ck_assert(NULL != pub);
+        ck_assert(NULL == cjose_jws_prepare(pub, header, payload, 7, &err));
+        ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+        cjose_jwk_release(pub);
+        cjose_jwk_release(key);
+        cjose_get_dealloc()(json);
+    }
+    cjose_jws_prepared_t *empty = cjose_jws_prepare(public_jwk, header, (const uint8_t *)"", 0, &err);
+    ck_assert(NULL != empty);
+    const uint8_t *input = NULL;
+    size_t input_len = 0;
+    ck_assert(cjose_jws_prepared_get_signing_input(empty, &input, &input_len, &err));
+    ck_assert_int_eq(strlen("eyJhbGciOiJFUzI1NiJ9."), input_len);
+    ck_assert(0 == memcmp(input, "eyJhbGciOiJFUzI1NiJ9.", input_len));
+    cjose_jws_prepared_release(empty);
+    cjose_jws_prepared_release(NULL);
+    cjose_header_release(header);
+    cjose_jwk_release(public_jwk);
+}
+END_TEST
+
+START_TEST(test_cjose_jws_external_bad_complete)
+{
+    cjose_err err;
+    cjose_jws_prepared_t *prepared = _external_prepare(&err);
+    const uint8_t *input = JWS_EXTERNAL_SIGNATURE;
+    size_t input_len = 123;
+    ck_assert(!cjose_jws_prepared_get_signing_input(NULL, &input, &input_len, &err));
+    ck_assert(input == JWS_EXTERNAL_SIGNATURE);
+    ck_assert_int_eq(123, input_len);
+    ck_assert(!cjose_jws_prepared_get_signing_input(prepared, NULL, &input_len, &err));
+    ck_assert(!cjose_jws_prepared_get_signing_input(prepared, &input, NULL, &err));
+    ck_assert(!cjose_jws_prepared_get_digest(NULL, &input, &input_len, &err));
+    ck_assert(input == JWS_EXTERNAL_SIGNATURE);
+    ck_assert_int_eq(123, input_len);
+    ck_assert(!cjose_jws_prepared_get_digest(prepared, NULL, &input_len, &err));
+    ck_assert(!cjose_jws_prepared_get_digest(prepared, &input, NULL, &err));
+    ck_assert(NULL == cjose_jws_complete(NULL, JWS_EXTERNAL_SIGNATURE, 64, &err));
+    ck_assert(NULL == cjose_jws_complete(prepared, NULL, 64, &err));
+    const size_t bad_lens[] = { 0, 1, 63, 65, SIZE_MAX };
+    for (size_t i = 0; i < sizeof(bad_lens) / sizeof(bad_lens[0]); ++i)
+    {
+        ck_assert(NULL == cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, bad_lens[i], &err));
+        ck_assert_int_eq(CJOSE_ERR_INVALID_ARG, err.code);
+    }
+    uint8_t invalid[64] = { 0 };
+    ck_assert(NULL == cjose_jws_complete(prepared, invalid, sizeof(invalid), &err));
+    ck_assert_int_eq(CJOSE_ERR_CRYPTO, err.code);
+    memcpy(invalid, JWS_EXTERNAL_SIGNATURE, sizeof(invalid));
+    invalid[0] ^= 1;
+    ck_assert(NULL == cjose_jws_complete(prepared, invalid, sizeof(invalid), &err));
+    ck_assert_int_eq(CJOSE_ERR_CRYPTO, err.code);
+    cjose_jws_t *jws = cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err);
+    ck_assert(NULL != jws);
+    cjose_jws_release(jws);
+    cjose_jws_prepared_release(prepared);
+
+    // A valid signature for a different public key must not complete the state.
+    cjose_jwk_t *key = cjose_jwk_import(JWK_COMMON_EC, strlen(JWK_COMMON_EC), &err);
+    ck_assert(NULL != key);
+    char *json = cjose_jwk_to_json(key, false, &err);
+    ck_assert(NULL != json);
+    cjose_jwk_t *pub = cjose_jwk_import(json, strlen(json), &err);
+    ck_assert(NULL != pub);
+    cjose_header_t *header = cjose_header_new(&err);
+    ck_assert(NULL != header);
+    ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, CJOSE_HDR_ALG_ES256, &err));
+    prepared = cjose_jws_prepare(pub, header, (const uint8_t *)JWS_EXTERNAL_PAYLOAD, strlen(JWS_EXTERNAL_PAYLOAD), &err);
+    ck_assert(NULL != prepared);
+    ck_assert(NULL == cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err));
+    ck_assert_int_eq(CJOSE_ERR_CRYPTO, err.code);
+    cjose_jws_prepared_release(prepared);
+    cjose_header_release(header);
+    cjose_jwk_release(pub);
+    cjose_get_dealloc()(json);
+    cjose_jwk_release(key);
+}
+END_TEST
+
+START_TEST(test_cjose_jws_external_alloc_failure)
+{
+    cjose_err err;
+    cjose_jwk_t *jwk = cjose_jwk_import(JWK_EXTERNAL_PUBLIC, strlen(JWK_EXTERNAL_PUBLIC), &err);
+    cjose_header_t *header = cjose_header_new(&err);
+    ck_assert(NULL != jwk);
+    ck_assert(NULL != header);
+    ck_assert(cjose_header_set(header, CJOSE_HDR_ALG, CJOSE_HDR_ALG_ES256, &err));
+    cjose_alloc_fn_t saved_alloc = cjose_get_alloc();
+    cjose_realloc_fn_t saved_realloc = cjose_get_realloc();
+    cjose_dealloc_fn_t saved_dealloc = cjose_get_dealloc();
+    const size_t prepare_sizes[] = { sizeof(cjose_jws_prepared_t), sizeof(cjose_jws_t) };
+    for (size_t i = 0; i < sizeof(prepare_sizes) / sizeof(prepare_sizes[0]); ++i)
+    {
+        _jws_saved_alloc = saved_alloc;
+        _jws_fail_alloc_size = prepare_sizes[i];
+        cjose_set_alloc_funcs(_jws_fail_selected_alloc, saved_realloc, saved_dealloc);
+        cjose_jws_prepared_t *prepared
+            = cjose_jws_prepare(jwk, header, (const uint8_t *)JWS_EXTERNAL_PAYLOAD, strlen(JWS_EXTERNAL_PAYLOAD), &err);
+        cjose_set_alloc_funcs(saved_alloc, saved_realloc, saved_dealloc);
+        _jws_saved_alloc = NULL;
+        _jws_fail_alloc_size = 0;
+        ck_assert(NULL == prepared);
+        ck_assert_int_eq(CJOSE_ERR_NO_MEMORY, err.code);
+    }
+    const size_t complete_sizes[] = { 64, 89, strlen(JWS_EXTERNAL_COMPACT) + 1 };
+    for (size_t i = 0; i < sizeof(complete_sizes) / sizeof(complete_sizes[0]); ++i)
+    {
+        cjose_jws_prepared_t *prepared = _external_prepare(&err);
+        _jws_saved_alloc = saved_alloc;
+        _jws_fail_alloc_size = complete_sizes[i];
+        cjose_set_alloc_funcs(_jws_fail_selected_alloc, saved_realloc, saved_dealloc);
+        cjose_jws_t *jws = cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err);
+        cjose_set_alloc_funcs(saved_alloc, saved_realloc, saved_dealloc);
+        _jws_saved_alloc = NULL;
+        _jws_fail_alloc_size = 0;
+        ck_assert(NULL == jws);
+        ck_assert_int_eq(CJOSE_ERR_NO_MEMORY, err.code);
+        const uint8_t *input = NULL;
+        size_t input_len = 0;
+        ck_assert(cjose_jws_prepared_get_signing_input(prepared, &input, &input_len, &err));
+        ck_assert_int_eq(strlen(JWS_EXTERNAL_INPUT), input_len);
+        ck_assert(0 == memcmp(JWS_EXTERNAL_INPUT, input, input_len));
+        jws = cjose_jws_complete(prepared, JWS_EXTERNAL_SIGNATURE, sizeof(JWS_EXTERNAL_SIGNATURE), &err);
+        ck_assert_msg(NULL != jws, "allocation failure made completion non-retryable: %s", err.message);
+        cjose_jws_release(jws);
+        cjose_jws_prepared_release(prepared);
+    }
+    cjose_header_release(header);
+    cjose_jwk_release(jwk);
+}
+END_TEST
+
 Suite *cjose_jws_suite(void)
 {
     Suite *suite = suite_create("jws");
@@ -1585,6 +1916,11 @@ Suite *cjose_jws_suite(void)
     tcase_add_test(tc_jws, test_cjose_jws_verify_ps_sig_bad_length);
     tcase_add_test(tc_jws, test_cjose_jws_verify_ps_alloc_failure);
     tcase_add_test(tc_jws, test_cjose_jws_verify_ec_sig_bad_length);
+    tcase_add_test(tc_jws, test_cjose_jws_external_vector);
+    tcase_add_test(tc_jws, test_cjose_jws_external_caller_mutation);
+    tcase_add_test(tc_jws, test_cjose_jws_external_bad_prepare);
+    tcase_add_test(tc_jws, test_cjose_jws_external_bad_complete);
+    tcase_add_test(tc_jws, test_cjose_jws_external_alloc_failure);
     suite_add_tcase(suite, tc_jws);
 
     return suite;

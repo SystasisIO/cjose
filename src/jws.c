@@ -12,6 +12,7 @@
 #include <cjose/util.h>
 
 #include <string.h>
+#include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/bn.h>
@@ -683,6 +684,241 @@ static bool _cjose_jws_build_cser(cjose_jws_t *jws, cjose_err *err)
     snprintf(jws->cser, jws->cser_len, "%s.%s.%s", jws->hdr_b64u, jws->dat_b64u, jws->sig_b64u);
 
     return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+cjose_jws_prepared_t *cjose_jws_prepare(const cjose_jwk_t *public_jwk,
+                                     cjose_header_t *protected_header,
+                                     const uint8_t *plaintext,
+                                     size_t plaintext_len,
+                                     cjose_err *err)
+{
+    cjose_jws_prepared_t *prepared = NULL;
+    json_t *header = NULL;
+    char *public_json = NULL;
+
+    if (NULL == public_jwk || !json_is_object((json_t *)protected_header) || NULL == plaintext
+        || plaintext_len > (SIZE_MAX - 4) / 4 * 3 || public_jwk->kty != CJOSE_JWK_KTY_EC
+        || NULL == public_jwk->keydata)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return NULL;
+    }
+
+    ec_keydata *keydata = (ec_keydata *)public_jwk->keydata;
+    if (CJOSE_JWK_EC_P_256 != keydata->crv || NULL == keydata->key
+        || NULL != EC_KEY_get0_private_key(keydata->key) || NULL == EC_KEY_get0_group(keydata->key)
+        || CJOSE_JWK_EC_P_256 != EC_GROUP_get_curve_name(EC_KEY_get0_group(keydata->key))
+        || NULL == EC_KEY_get0_public_key(keydata->key) || 1 != EC_KEY_check_key(keydata->key))
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return NULL;
+    }
+
+    json_t *alg = json_object_get((json_t *)protected_header, CJOSE_HDR_ALG);
+    json_t *expected_alg = json_string(CJOSE_HDR_ALG_ES256);
+    if (NULL == expected_alg)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        return NULL;
+    }
+    bool valid_alg = json_equal(alg, expected_alg);
+    json_decref(expected_alg);
+    if (!valid_alg || NULL != json_object_get((json_t *)protected_header, "b64"))
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return NULL;
+    }
+
+    prepared = (cjose_jws_prepared_t *)cjose_get_alloc()(sizeof(cjose_jws_prepared_t));
+    if (NULL == prepared)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        return NULL;
+    }
+    memset(prepared, 0, sizeof(cjose_jws_prepared_t));
+
+    prepared->jws = (cjose_jws_t *)cjose_get_alloc()(sizeof(cjose_jws_t));
+    if (NULL == prepared->jws)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        goto prepare_failed;
+    }
+    memset(prepared->jws, 0, sizeof(cjose_jws_t));
+
+    header = json_deep_copy((json_t *)protected_header);
+    if (NULL == header)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        goto prepare_failed;
+    }
+    if (!_cjose_jws_build_hdr(prepared->jws, (cjose_header_t *)header, err)
+        || !_cjose_jws_validate_hdr(prepared->jws, err))
+    {
+        goto prepare_failed;
+    }
+
+    // Round-trip only the public fields through the existing JWK implementation.
+    public_json = cjose_jwk_to_json(public_jwk, false, err);
+    if (NULL == public_json)
+    {
+        goto prepare_failed;
+    }
+    prepared->jwk = cjose_jwk_import(public_json, strlen(public_json), err);
+    if (NULL == prepared->jwk)
+    {
+        goto prepare_failed;
+    }
+
+    cjose_jws_t *jws = prepared->jws;
+    // Reserve two dots, the 86-byte ES256 signature encoding and a terminator
+    // within the existing snprintf serializer's int-sized output limit.
+    size_t encoded_len = plaintext_len / 3 * 4 + (plaintext_len % 3 ? plaintext_len % 3 + 1 : 0);
+    if (jws->hdr_b64u_len > (size_t)INT_MAX - 89 || encoded_len > (size_t)INT_MAX - 89 - jws->hdr_b64u_len)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        goto prepare_failed;
+    }
+    if (0 == plaintext_len)
+    {
+        // Keep the empty payload owned without relying on malloc(0) behavior.
+        jws->dat = (uint8_t *)cjose_get_alloc()(1);
+        if (NULL == jws->dat)
+        {
+            CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+            goto prepare_failed;
+        }
+        jws->dat[0] = 0;
+        if (!cjose_base64url_encode(plaintext, 0, &jws->dat_b64u, &jws->dat_b64u_len, err))
+        {
+            goto prepare_failed;
+        }
+    }
+    else if (!_cjose_jws_build_dat(jws, plaintext, plaintext_len, err))
+    {
+        goto prepare_failed;
+    }
+    prepared->input_len = jws->hdr_b64u_len + 1 + jws->dat_b64u_len;
+    prepared->input = (uint8_t *)cjose_get_alloc()(prepared->input_len);
+    if (NULL == prepared->input)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        goto prepare_failed;
+    }
+    memcpy(prepared->input, jws->hdr_b64u, jws->hdr_b64u_len);
+    prepared->input[jws->hdr_b64u_len] = '.';
+    memcpy(prepared->input + jws->hdr_b64u_len + 1, jws->dat_b64u, jws->dat_b64u_len);
+
+    if (!jws->fns.digest(jws, prepared->jwk, err))
+    {
+        goto prepare_failed;
+    }
+    if (jws->dig_len != sizeof(prepared->digest))
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_STATE);
+        goto prepare_failed;
+    }
+    memcpy(prepared->digest, jws->dig, sizeof(prepared->digest));
+
+    json_decref(header);
+    cjose_get_dealloc()(public_json);
+    return prepared;
+
+prepare_failed:
+    json_decref(header);
+    cjose_get_dealloc()(public_json);
+    cjose_jws_prepared_release(prepared);
+    return NULL;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+bool cjose_jws_prepared_get_signing_input(
+    const cjose_jws_prepared_t *prepared, const uint8_t **input, size_t *input_len, cjose_err *err)
+{
+    if (NULL == prepared || NULL == input || NULL == input_len)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return false;
+    }
+    *input = prepared->input;
+    *input_len = prepared->input_len;
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+bool cjose_jws_prepared_get_digest(
+    const cjose_jws_prepared_t *prepared, const uint8_t **digest, size_t *digest_len, cjose_err *err)
+{
+    if (NULL == prepared || NULL == digest || NULL == digest_len)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return false;
+    }
+    *digest = prepared->digest;
+    *digest_len = sizeof(prepared->digest);
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+cjose_jws_t *cjose_jws_complete(
+    cjose_jws_prepared_t *prepared, const uint8_t *signature, size_t signature_len, cjose_err *err)
+{
+    if (NULL == prepared)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return NULL;
+    }
+    if (NULL == prepared->jws)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_STATE);
+        return NULL;
+    }
+    if (NULL == signature || 64 != signature_len)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_INVALID_ARG);
+        return NULL;
+    }
+
+    cjose_jws_t *jws = prepared->jws;
+    jws->sig = (uint8_t *)cjose_get_alloc()(signature_len);
+    if (NULL == jws->sig)
+    {
+        CJOSE_ERROR(err, CJOSE_ERR_NO_MEMORY);
+        return NULL;
+    }
+    jws->sig_len = signature_len;
+    memcpy(jws->sig, signature, signature_len);
+
+    // Verify the saved digest and key before publishing any completed JWS.
+    if (!jws->fns.verify(jws, prepared->jwk, err)
+        || !cjose_base64url_encode(jws->sig, jws->sig_len, &jws->sig_b64u, &jws->sig_b64u_len, err)
+        || !_cjose_jws_build_cser(jws, err))
+    {
+        _cjose_cleanse_dealloc(jws->sig, jws->sig_len);
+        jws->sig = NULL;
+        jws->sig_len = 0;
+        cjose_get_dealloc()(jws->sig_b64u);
+        jws->sig_b64u = NULL;
+        jws->sig_b64u_len = 0;
+        jws->cser_len = 0;
+        return NULL;
+    }
+
+    prepared->jws = NULL;
+    return jws;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+void cjose_jws_prepared_release(cjose_jws_prepared_t *prepared)
+{
+    if (NULL == prepared)
+    {
+        return;
+    }
+    cjose_jws_release(prepared->jws);
+    cjose_jwk_release(prepared->jwk);
+    _cjose_cleanse_dealloc(prepared->input, prepared->input_len);
+    _cjose_cleanse_dealloc(prepared, sizeof(cjose_jws_prepared_t));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

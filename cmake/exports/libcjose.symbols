@@ -89,10 +89,15 @@ _cjose_jwk_release
 _cjose_jwk_retain
 _cjose_jwk_set_kid
 _cjose_jwk_to_json
+_cjose_jws_complete
 _cjose_jws_export
 _cjose_jws_get_plaintext
 _cjose_jws_get_protected
 _cjose_jws_import
+_cjose_jws_prepare
+_cjose_jws_prepared_get_digest
+_cjose_jws_prepared_get_signing_input
+_cjose_jws_prepared_release
 _cjose_jws_release
 _cjose_jws_sign
 _cjose_jws_verify

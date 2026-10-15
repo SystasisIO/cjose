@@ -92,10 +92,15 @@
         cjose_jwk_retain;
         cjose_jwk_set_kid;
         cjose_jwk_to_json;
+        cjose_jws_complete;
         cjose_jws_export;
         cjose_jws_get_plaintext;
         cjose_jws_get_protected;
         cjose_jws_import;
+        cjose_jws_prepare;
+        cjose_jws_prepared_get_digest;
+        cjose_jws_prepared_get_signing_input;
+        cjose_jws_prepared_release;
         cjose_jws_release;
         cjose_jws_sign;
         cjose_jws_verify;

@@ -51,4 +51,14 @@ struct _cjose_jws_int
     jws_fntable fns; // functions for building JWS parts
 };
 
+// Prepared external-signing state; the normal JWS layout stays unchanged.
+struct _cjose_jws_prepared_int
+{
+    cjose_jws_t *jws; // transferred to the caller only after successful completion
+    cjose_jwk_t *jwk; // independent public-only key
+    uint8_t *input;
+    size_t input_len;
+    uint8_t digest[32]; // remains available after the JWS is transferred
+};
+
 #endif // SRC_JWS_INT_H
